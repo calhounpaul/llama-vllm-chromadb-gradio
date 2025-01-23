@@ -50,7 +50,7 @@ if [ -z "$(tmux list-sessions | grep vllm_server_main)" ]; then
         --task generate \
         --dtype half \
         --port 8999 \
-        --gpu-memory-utilization 0.75 \
+        --gpu-memory-utilization 0.50 \
         --max-model-len 8192 \
         --host 0.0.0.0 && exit'
 fi
@@ -62,7 +62,7 @@ if [ -z "$(tmux list-sessions | grep vllm_server_embedding)" ]; then
         --task embed \
         --dtype half \
         --port 8998 \
-        --gpu-memory-utilization 0.25 \
+        --gpu-memory-utilization 0.50 \
         --host 0.0.0.0 && exit'
 
 #    --quantization gptq --dtype half \
@@ -75,12 +75,12 @@ while ! curl -s localhost:8998/v1/models | grep -q $EMBED_MODEL_ESCAPED_NAME; do
     sleep 2
 done
 
-#while ! curl -s localhost:8999/v1/models | grep -q $MAIN_MODEL_ESCAPED_NAME; do
-if false; then
+while ! curl -s localhost:8999/v1/models | grep -q $MAIN_MODEL_ESCAPED_NAME; do
+    #if false; then
     echo "Waiting for vllm_server_main to start..."
     sleep 2
-#done
-fi
+done
+#fi
 
 if [ -z "$(tmux list-sessions | grep chatbot_app)" ]; then
     echo "Starting chatbot_app"
