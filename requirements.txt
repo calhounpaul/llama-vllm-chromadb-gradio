@@ -1,0 +1,11 @@
+vllm
+openai
+huggingface_hub[hf_transfer]
+chromadb
+fuzzywuzzy
+nltk
+python-Levenshtein
+accelerate
+gradio
+brave-search-python-client
+semchunk
