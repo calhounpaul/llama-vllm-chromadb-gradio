@@ -2,7 +2,10 @@
 
 #MAIN_MODEL_NAME=meta-llama/Llama-3.2-3B-Instruct
 MAIN_MODEL_NAME=hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
+#MAIN_MODEL_NAME=casperhansen/llama-3.3-70b-instruct-awq
+#MAIN_MODEL_NAME=shuyuej/Llama-3.3-70B-Instruct-GPTQ
 MAIN_MODEL_ESCAPED_NAME=$(echo $MAIN_MODEL_NAME | sed 's/\//-/g')
+#MAIN_MODEL_ESCAPED_NAME=Llama-3.3-70B-Instruct-Q3_K_M.gguf
 MAIN_MODEL_PATH=models_cache/$MAIN_MODEL_ESCAPED_NAME
 #EMBED_MODEL_NAME=sentence-transformers/all-roberta-large-v1
 EMBED_MODEL_NAME=intfloat/multilingual-e5-large
@@ -50,9 +53,11 @@ if [ -z "$(tmux list-sessions | grep vllm_server_main)" ]; then
         --task generate \
         --dtype half \
         --port 8999 \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.90 \
         --max-model-len 8192 \
         --host 0.0.0.0 && exit'
+        #--quantization gptq \
+        #--tensor-parallel-size 2 \ #(this option can fit a 70b model across 2x 3090s with 24GB each of VRAM with 4bit AWQ encryption)
 fi
 
 if [ -z "$(tmux list-sessions | grep vllm_server_embedding)" ]; then
@@ -62,12 +67,10 @@ if [ -z "$(tmux list-sessions | grep vllm_server_embedding)" ]; then
         --task embed \
         --dtype half \
         --port 8998 \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.10 \
         --host 0.0.0.0 && exit'
-
-#    --quantization gptq --dtype half \
-#    --enable-auto-tool-choice \
-#    --quantization gptq \
+        #--tensor-parallel-size 2 \
+        #--quantization gptq \
 fi
 
 while ! curl -s localhost:8998/v1/models | grep -q $EMBED_MODEL_ESCAPED_NAME; do
@@ -76,15 +79,12 @@ while ! curl -s localhost:8998/v1/models | grep -q $EMBED_MODEL_ESCAPED_NAME; do
 done
 
 while ! curl -s localhost:8999/v1/models | grep -q $MAIN_MODEL_ESCAPED_NAME; do
-    #if false; then
     echo "Waiting for vllm_server_main to start..."
     sleep 2
 done
-#fi
 
 if [ -z "$(tmux list-sessions | grep chatbot_app)" ]; then
     echo "Starting chatbot_app"
     tmux new-session -d -s chatbot_app \
         'venv/bin/python3 app.py && exit'
-    #venv/bin/python3 app.py
 fi
