@@ -5,12 +5,13 @@ import gradio as gr
 from openai import OpenAI
 import torch
 import torch.nn.functional as F
-from transformers import AutoModel
 from nltk.tokenize import word_tokenize
 import chromadb
+from transformers import AutoTokenizer
+import semchunk
 
 # Set your batch size here
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 
 ENDPOINT_URL = "http://0.0.0.0:8999/v1"
 
@@ -19,35 +20,26 @@ todays_date_string = datetime.date.today().strftime("%d %B %Y")
 RECREATE_DB = not os.path.exists("db/")
 VERBOSE_SHELL = True
 
-SYSTEM_PROMPT = """Cutting Knowledge Date: December 2023
-Today Date: """ + todays_date_string + """
+NAME_OF_THING_BEING_SEARCHED = "The Enron Email Dataset"
+DESCRIPTION_OF_THING_BEING_SEARCHED = (
+        "a collection of emails exchanged by Enron employees, made public during investigations into the company's " + \
+        "collapse. The dataset provides insight into corporate communication, organizational structure, and decision-making " + \
+        "processes during a pivotal moment in business history. It has become a valuable resource for researchers in fields like data science, sociology, and linguistics."
+    )
+KEY_FEATURES_OF_THING_BEING_SEARCHED = [
+    "Over 600,000 emails from approximately 158 employees, primarily senior management.",
+    "Messages detailing internal communication, policy discussions, and personal exchanges.",
+    "A structure that preserves metadata such as timestamps, recipients, and subject lines.",
+]
 
-You are a helpful assistant with tool calling capabilities.
+SEARCH_FUNCTION_NAME = "enron_email_search"
 
-You specialize in Enron email documentation retrieval and consolidation. You have access to a documentation search function to help answer queries accurately.
-The Enron Email Dataset is a collection of emails exchanged by Enron employees, made public during investigations into the company's collapse. The dataset provides insight into corporate communication, organizational structure, and decision-making processes during a pivotal moment in business history. It has become a valuable resource for researchers in fields like data science, sociology, and linguistics.
-
-Key features of the dataset include:
-- Over 600,000 emails from approximately 158 employees, primarily senior management.
-- Messages detailing internal communication, policy discussions, and personal exchanges.
-- A structure that preserves metadata such as timestamps, recipients, and subject lines.
-
-The dataset addresses challenges in understanding corporate dynamics and offers a unique opportunity to study real-world organizational behavior. Researchers have used it to analyze social networks, detect anomalies, and develop natural language processing tools.
-
-If you choose to use one of the following functions, respond with a JSON for a function call with its proper arguments that best answers the given prompt.
-
-Respond in the format {{"name": function name, "parameters": dictionary of argument name and its value}}. Do not use variables.
-
-{functions}
-
-After receiving the results back from a function (formatted as {{"name": function name, "return": returned data after running function}}) formulate your response to the user. Do not mention that you are using retrieved/returned data to answer the question. If the information needed is not found in the returned data, either attempt a new function call, or inform the user that you cannot answer based on your available knowledge. The user cannot see the function results. They are only aware that you have access to a documentation search tool. So don't say "Based on the search results..." or anything similar. Just answer the question directly."""
-
-FUNCTIONS_LIST = [
+functions_list = [
     {
         "type": "function",
         "function": {
-            "name": "enron_email_search",
-            "description": "Search for a query string in the Enron email documentation",
+            "name": SEARCH_FUNCTION_NAME,
+            "description": "Search for a query string in the " + NAME_OF_THING_BEING_SEARCHED,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -67,6 +59,22 @@ FUNCTIONS_LIST = [
     },
 ]
 
+system_prompt = """Cutting Knowledge Date: December 2023
+Today Date: """ + todays_date_string + """
+
+You are a helpful assistant with tool calling capabilities.
+
+You specialize in """ + NAME_OF_THING_BEING_SEARCHED + """ retrieval and consolidation. You have access to a documentation search function to help answer queries accurately.
+""" + NAME_OF_THING_BEING_SEARCHED + """ is """ + DESCRIPTION_OF_THING_BEING_SEARCHED + """
+
+""" + ("Key features of the dataset include:\n- " + "\n- ".join(KEY_FEATURES_OF_THING_BEING_SEARCHED) + "\n" if KEY_FEATURES_OF_THING_BEING_SEARCHED else "") + """
+If you choose to use one of the following functions, respond with a JSON for a function call with its proper arguments that best answers the given prompt.
+
+Your tool request should be in the format {{"name": function name, "parameters": dictionary of argument name and its value}}. Do not use variables. Just a two-key dictionary, starting with the function name, followed by a dictionary of parameters.
+
+{functions}
+
+After receiving the results back from a function (formatted as {{"name": function name, "return": returned data after running function}}) formulate your response to the user. Do not mention that you are using retrieved/returned data to answer the question. If the information needed is not found in the returned data, either attempt a new function call, or inform the user that you cannot answer based on your available knowledge. The user cannot see the function results. They are only aware that you have access to a documentation search tool. So don't say "Based on the search results..." or anything similar. Just answer the question directly or make another function call."""
 
 ###############################
 # ChromaDB Indexing Functions #
@@ -114,8 +122,6 @@ def depr_chunk_text_by_tokens(text: str, max_tokens: int = 512,overlap=0.2,min_t
         chunks.append(" ".join(current_chunk))
     return chunks
 
-from transformers import AutoTokenizer
-import semchunk
 
 local_embed_tokenizer = None
 
@@ -201,8 +207,8 @@ def create_search_index(db_directory: str = "db/",
     if os.path.exists("db/.progress"):
         with open("db/.progress", "r") as f:
             email_idx_start = int(f.read().strip())
-    for email_idx, row in enumerate(ds):
-        if email_idx < email_idx_start:
+    for entry_idx, row in enumerate(ds):
+        if entry_idx < email_idx_start:
             continue
         text = row["text"]
         if not text:
@@ -213,7 +219,7 @@ def create_search_index(db_directory: str = "db/",
 
         # Prepare chunks for embedding
         for c_idx, chunk in enumerate(chunks):
-            snippet_id = f"email_{email_idx}_chunk_{c_idx}"
+            snippet_id = f"email_{entry_idx}_chunk_{c_idx}"
 
             # Skip if already indexed
             found = collection.get(ids=[snippet_id])
@@ -224,7 +230,7 @@ def create_search_index(db_directory: str = "db/",
                 "text": chunk,
                 "snippet_id": snippet_id,
                 "metadata": {
-                    "email_idx": email_idx,
+                    "email_idx": entry_idx,
                     "chunk_index": c_idx
                 }
             })
@@ -234,10 +240,10 @@ def create_search_index(db_directory: str = "db/",
                 process_batch(batch_data)
                 batch_data = []
 
-        if (email_idx + 1) % 1000 == 0:
-            print(f"Processed {email_idx + 1}/{total_emails} emails...")
+        if (entry_idx + 1) % 1000 == 0:
+            print(f"Processed {entry_idx + 1}/{total_emails} entries...")
             with open("db/.progress", "w") as f:
-                f.write(str(email_idx ))
+                f.write(str(entry_idx ))
 
     # Process any remaining items in the batch
     if batch_data:
@@ -297,15 +303,18 @@ if not os.path.exists("db/.completed"):
         f.write("")
 
 
-FUNCTIONS_DICT = {f["function"]["name"]: f for f in FUNCTIONS_LIST}
+functions_dict = {f["function"]["name"]: f for f in functions_list}
 FUNCTION_BACKENDS = {
-    "enron_email_search": search_text,
+    SEARCH_FUNCTION_NAME: search_text,
 }
 
 EOT_STRING = "<|eot_id|>"
 FUNCTION_EOT_STRING = "<|eom_id|>"
 ROLE_HEADER = "<|start_header_id|>{role}<|end_header_id|>"
 INIT_STRING = "<|begin_of_text|>"
+
+functions_string = "\n\n".join([json.dumps(functions_dict[f], indent=4) for f in functions_dict.keys()])
+print(system_prompt.format(functions=functions_string))
 
 class LLM:
     def __init__(self, max_model_len: int = 4096):
@@ -336,14 +345,14 @@ class LLM:
         return self.client.completions.create(**completion_params)
 
 
-def form_chat_prompt(message_history, functions=FUNCTIONS_DICT.keys()):
+def form_chat_prompt(message_history, functions=functions_dict.keys()):
     """Builds the custom text prompt for your vLLM."""
-    functions_string = "\n\n".join([json.dumps(FUNCTIONS_DICT[f], indent=4) for f in functions])
+    functions_string = "\n\n".join([json.dumps(functions_dict[f], indent=4) for f in functions])
     full_prompt = (
         INIT_STRING
         + ROLE_HEADER.format(role="system")
         + "\n\n"
-        + SYSTEM_PROMPT.format(functions=functions_string)
+        + system_prompt.format(functions=functions_string)
         + EOT_STRING
     )
     for message in message_history:
@@ -359,12 +368,12 @@ def form_chat_prompt(message_history, functions=FUNCTIONS_DICT.keys()):
 
 def check_assistant_response_for_tool_calls(response):
     """If the LLM output is JSON with function call data, parse it."""
-    response = response.replace(EOT_STRING, "").replace(FUNCTION_EOT_STRING, "").strip()
-    for tool_name in FUNCTIONS_DICT.keys():
-        if f"\"{tool_name}\"" in response and response.startswith("{"):
-            # Try to find the last '}' character of this json and remove the rest of the string
+    response = response.split(FUNCTION_EOT_STRING)[0].split(EOT_STRING)[0]
+    for tool_name in functions_dict.keys():
+        if f"\"{tool_name}\"" in response and "{" in response:
+            response = "{" + "{".join(response.split("{")[1:])
             for _ in range(10):
-                response = response.rsplit('}', 1)[0] + '}'
+                response = "}".join(response.split("}")[:-1]) + "}"
                 try:
                     return json.loads(response)
                 except json.JSONDecodeError:
@@ -381,7 +390,7 @@ def process_tool_request(tool_request_data):
 
     if tool_name == "enron_email_search":
         query = tool_parameters["query"]
-        top_n = min(7, max(int(tool_parameters.get("max_results", 3)), 2))
+        top_n = min(5, max(int(tool_parameters.get("max_results", 3)), 2))
         search_results = FUNCTION_BACKENDS[tool_name](query, top_n=top_n)
         print("Search results:", search_results)
         return {"name": "enron_email_search", "results": search_results}
@@ -422,7 +431,7 @@ def iterate_chat(llm, sampling_params, full_history):
         assistant_response = output.choices[0].text.strip()
         if VERBOSE_SHELL:
             print("Assistant response: " + assistant_response + "\n===================================")
-        assistant_response = assistant_response.replace(EOT_STRING, "").replace(FUNCTION_EOT_STRING, "")
+        assistant_response = assistant_response.split(FUNCTION_EOT_STRING)[0].split(EOT_STRING)[0]
 
         tool_request_data = check_assistant_response_for_tool_calls(assistant_response)
         if not tool_request_data:
@@ -467,7 +476,8 @@ def user_conversation(user_message, chat_history, full_history):
 sampling_params = {
     "temperature": 0.8,
     "top_p": 0.95,
-    "max_tokens": 2048,
+    "max_tokens": 512,
+    "stop_token_ids": [128001,128008,128009,128006],
 }
 
 # Initialize LLM
